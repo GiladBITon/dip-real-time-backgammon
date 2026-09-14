@@ -23,6 +23,9 @@ This project is heavily based on classical image processing pipelines:
 * **Morphological Operations (Dilation, Erosion, Closing):** Used to connect disjointed features, close contours, and filter out small noise artifacts.
 * **Contour Detection (FindContours):** Extracts the boundaries of objects (checkers, dice) for shape analysis and localization.
 
+## Dataset
+For the full dataset used to test the algorithms, [download it from Google Drive](https://drive.google.com/drive/folders/1AQIWKCQUX-agOKdFSaYSMVyaElTUszDo).
+
 ## Repository Structure
 ```text
 ├── src/                    # Source code (algorithms and logic)
