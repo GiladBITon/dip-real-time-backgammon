@@ -1,0 +1,845 @@
+import numpy as np
+import cv2
+from sklearn.cluster import DBSCAN
+from scipy.signal import find_peaks
+import matplotlib.pyplot as plt
+from skimage.metrics import structural_similarity as ssim
+from tifffile import astype
+
+"""Image Processing -------------------------------------------------------------------------------------------------"""
+def detect_dice(img, white_mask, black_mask, white_checkers, dice_data):
+    """ Detect and transform dice """
+    white_checkers_img = np.zeros_like(img)
+    for (x, y) in white_checkers:
+        cv2.circle(white_checkers_img, (x, y), int(img.shape[0] * 0.034), (255,255,255), cv2.FILLED)  # Green circles
+    white_checkers = cv2.cvtColor(white_checkers_img, cv2.COLOR_RGB2GRAY)  # 3 to 1 channel
+    difference = white_mask - white_checkers
+    difference = cv2.medianBlur(difference, 5)
+    difference = cv2.dilate(difference, np.ones((3, 3), np.uint8), iterations=1)
+    # plt.figure(figsize=(5, 5)), plt.imshow(difference, cmap='gray'), plt.show()
+    contours = cv2.findContours(difference, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
+
+    output = img.copy()
+    filtered_contours = [c for c in contours if 500 < cv2.contourArea(c) < 2000]
+    dice_xy = []
+    dice_images = []
+    for contour in contours:
+        # if len(dice_images) == 2:
+        #   break
+        if 500 < cv2.contourArea(contour) < 2000:
+            rect = cv2.minAreaRect(contour)
+            h, w = rect[1]
+            if h == 0 or w == 0:
+                continue
+            aspect_ratio = h / float(w) if w > h else w / float(h)
+            # print(aspect_ratio, cv2.contourArea(contour))
+            if (500 < cv2.contourArea(contour) < 1200 and 0.8 < aspect_ratio < 1.2) or (
+                    1000 < cv2.contourArea(contour) < 2000 and 0.3 < aspect_ratio < 0.7):
+                cv2.drawContours(img, [contour], -1, (255, 255, 0), 3)
+                # print(aspect_ratio, cv2.contourArea(contour))
+                box = np.intp(cv2.boxPoints(rect))
+                # cv2.polylines(img, [box], isClosed=True, color=(0, 255, 0), thickness=2)
+                # print(cv2.contourArea(contour), aspect_ratio)
+                # Compute the rotation matrix
+                angle = rect[-1] if rect[-1] > -45 else rect[-1] + 90  # Get the rotation angle
+
+                # Get the rotation matrix
+                (h, w) = output.shape[:2]
+                center = rect[0]
+                M = cv2.getRotationMatrix2D(center, angle, 1.0)
+
+                # Rotate the image
+                rotated = cv2.warpAffine(black_mask, M, (w, h))
+
+                # Get bounding box of rotated dice
+                x, y, w, h = cv2.boundingRect(np.intp(cv2.transform(np.array([box]), M)))
+                dice_roi = rotated[y:y + h, x:x + w]  # Crop rotated dice
+                dice_roi = cv2.threshold(dice_roi, 50, 255, cv2.THRESH_BINARY)[1]
+                # print(f"Before cut: {dice_roi.shape},{x},{y},{w},{h}, {cv2.contourArea(contour)}")
+                if dice_roi is None:
+                    continue
+                if cv2.contourArea(contour) < 1000:
+                    size = int((0.05 * (dice_roi.shape[0] + dice_roi.shape[1]) / 2))
+                    dice_images.append(dice_roi[size:-size,size:-size])
+                    dice_xy.append(box[0])
+                    cv2.drawContours(output, [contour], -1, (255, 255, 0), 3)
+                else:
+                    cut_dice = [dice_roi[:, :w // 2], dice_roi[:, w // 2:]] if w>h else [dice_roi[:h //2,:], dice_roi[h//2:,:]]
+                    for dice in cut_dice:
+                        size = int((0.05 * (dice.shape[0] + dice.shape[1]) / 2))
+                        dice_images.append(dice[size:-size,size:-size])
+                        dice_xy.append(box[0])
+
+    def rotate_image(image, angle):
+        """ Rotate an image by a given angle while keeping size consistent. """
+        height, width = image.shape[:2]
+        center = (width // 2, height // 2)
+        rotation_matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+        rotated = cv2.warpAffine(image, rotation_matrix, (width, height))
+        return rotated
+
+    def get_best_match(dice_image, reference_images):
+        """ Compare the real-time dice image against reference images with rotation handling. """
+        best_score = 0
+        best_match = None
+
+        for value, ref_img in reference_images.items():
+            # Rotate reference images only for dice values 2, 3, and 6
+            rotations = [0, 90] if value in [2, 3, 6] else [0]
+
+            for angle in rotations:
+                rotated_img = rotate_image(ref_img, angle)
+                # Resize to match the dice image dimensions
+                resized_ref = cv2.resize(rotated_img, (dice_image.shape[1], dice_image.shape[0]))
+
+                # Compute similarity score using matchTemplate
+                dice_image_norm = dice_image / 255
+                resized_ref = resized_ref / 255
+
+                # score = np.sum(dice_image_norm * resized_ref)
+                score = np.mean((dice_image_norm - resized_ref)**2)
+                print(value, score)
+
+                if score > best_score:
+                    best_score = score
+                    best_match = value
+
+        return best_match
+
+    """ Detect Number """
+    dice_numbers = []
+    # print(len(dice_images))
+    for i, dice in enumerate(dice_images):
+        # pred = get_best_match(dice, number_templates)
+        # dice = cv2.threshold(dice, 1, 255, cv2.THRESH_BINARY)[1]
+        # print(dice.shape)
+        try:
+            if dice.shape[0] == 0 or dice.shape[1] == 0 or dice.shape[0] > 35 or dice.shape[1] > 35:
+                continue
+            dots = template_match(dice, dice, threshold=0.5, min_samples=1, contour_color=(255, 255, 255),
+                                  checker_radius=2, draw=False)
+            if len(dots) > 0:
+                dice_num = int(np.clip(len(dots), 1, 6))
+                dice_numbers.append(dice_num)
+                dice_data["coordinates"][i] = dice_xy[i]
+            # print(f"Correct: {len(dots)}, Predicted: {pred}")
+        except:
+            continue
+        continue
+
+    # print(len(dice_images))
+    # if len(dice_images) > 1:
+    #     cv2.imshow("Dice", concat_images(dice_images[0], dice_images[1]))
+    dice_data["prev_frame_count"] = dice_data["curr_frame_count"]
+    dice_data["curr_frame_count"] = min(len(dice_images), len(dice_numbers))
+    return dice_images, dice_numbers
+
+def black_threshold(img, n_bins = 64): # Image in BGR format
+    blue_hist = cv2.calcHist([img], [2], None, [n_bins], [0, 256])
+    # plt.plot(blue_hist, color='b', label="Blue"), plt.show()
+    blue_hist_smooth = cv2.GaussianBlur(blue_hist, (5, 5), 0)  # Adjust kernel size as needed
+    # plt.plot(blue_hist_smooth, color='b', label="Blue"), plt.show()
+    peaks = find_peaks(blue_hist_smooth.flatten(), prominence=0.001)[0]  # Adjust prominence as needed
+    if blue_hist_smooth.flatten()[0] > blue_hist_smooth.flatten()[1]: # Peak is at the start boundary
+      black_thresh = (np.argmin(blue_hist_smooth[:peaks[0]])) * (256 / n_bins)
+    else:
+      black_thresh = (np.argmin(blue_hist_smooth[peaks[0]:peaks[1]]) + peaks[0]) * (256 / n_bins)
+    # print(f"Black Threshold: {black_thresh}")
+    black_mask = cv2.threshold(img[:, :, 2], black_thresh, 255, cv2.THRESH_BINARY_INV)[1]
+    # plt.figure(figsize=(5, 5)), plt.title("Black"), plt.imshow(black_mask), plt.axis('off'), plt.tight_layout(), plt.show()
+    return black_mask
+
+def white_threshold(img, n_bins = 64): # Image in BGR format
+    red_hist = cv2.calcHist([img], [0], None, [n_bins], [0, 256])
+    red_hist_smooth = cv2.GaussianBlur(red_hist, (5, 5), 0)  # Adjust kernel size as needed
+    peak = np.argmax(red_hist_smooth.flatten())
+    valley = np.argmin(red_hist_smooth[peak:n_bins]) + peak
+    indices = np.argwhere(red_hist_smooth < ((red_hist_smooth[peak] - red_hist_smooth[valley]) * 0.05) + red_hist_smooth[valley])[:,0]
+    indices = indices[indices > peak]
+    white_thresh = indices[0] * (256/n_bins)
+    # print(f"White Threshold: {white_thresh}")
+    white_mask = cv2.threshold(img[:, :, 0], white_thresh, 255, cv2.THRESH_BINARY)[1]
+    # plt.figure(figsize=(5, 5)), plt.title("Black"), plt.imshow(white_mask), plt.axis('off'), plt.tight_layout(), plt.show()
+    return white_mask
+
+def template_match(input_img, output_img, threshold=0.5, min_samples=1, contour_color=(0, 0, 255), checker_radius=22, draw=True):
+    # Create a Circular Template Matching Checker Size
+    # checker_radius = 22  # Approximate checker radius (Tune this based on actual size)
+    template_size = 2 * checker_radius
+    template = np.zeros((template_size, template_size), dtype=np.uint8)
+    cv2.circle(template, (checker_radius, checker_radius), checker_radius, 255, -1)
+
+    # Perform Template Matching (Normalized Cross-Correlation)
+    result = cv2.matchTemplate(input_img, template, cv2.TM_CCOEFF_NORMED)
+
+    # Extract Locations Where Similarity is High
+    locations = np.where(result >= threshold)
+
+    # Extract detected checker locations from template matching
+    raw_coordinates = np.array([(pt[0] + checker_radius, pt[1] + checker_radius) for pt in zip(*locations[::-1])])
+
+    # Define Clustering Parameters
+    eps = checker_radius  # Maximum distance for points to be considered in the same cluster
+
+    final_checker_coordinates = []
+    # Apply DBSCAN Clustering
+    if len(raw_coordinates) > 0:
+        clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(raw_coordinates)
+        unique_clusters = np.unique(clustering.labels_)
+
+        # Compute Mean Position for Each Cluster (Final Detected Checkers)
+        final_checker_coordinates = []
+        for cluster in unique_clusters:
+            if cluster == -1:
+                continue  # Ignore noise points
+
+            cluster_points = raw_coordinates[clustering.labels_ == cluster]
+            mean_x = int(np.mean(cluster_points[:, 0]))
+            mean_y = int(np.mean(cluster_points[:, 1]))
+            final_checker_coordinates.append((mean_x, mean_y))
+
+    # Draw Detected Checkers
+    if draw:
+        for (x, y) in final_checker_coordinates:
+            cv2.circle(output_img, (x, y), checker_radius, contour_color, cv2.FILLED)  # Green circles
+
+    return final_checker_coordinates
+
+def show_dice(dice_images, dice_num):
+    font = cv2.FONT_HERSHEY_TRIPLEX
+    font_scale = 1
+    thickness = 2
+    text_color = (255, 255, 255)  # White text
+    dice_show = []
+    dice_count = min(len(dice_images), len(dice_num))
+    # print(f"Count: {dice_count}")
+    for i in range(dice_count):
+        img = np.zeros_like(dice_images[i])
+        text = str(dice_num[i])
+        # Get text size
+        (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+        # Calculate text position
+        image_height, image_width = img.shape
+        x = (image_width - text_width) // 2
+        y = (image_height + text_height) // 2
+        # Put text on top of background
+        cv2.putText(img, text, (x, y), font, font_scale, text_color, thickness)
+        dice_show.append(concat_images(dice_images[i], img))
+
+        # cv2.imwrite(f"/Users/razbarak/PycharmProjects/PythonProject/DIP_Final_Project/webcam_frames_5/dice_{dice_num[i]}.jpg", dice_images[i])
+
+    if dice_count == 0:
+        return None
+    if dice_count == 1:
+        return dice_show[0]
+    if dice_count == 2:
+        return concat_images(dice_show[0], dice_show[1], "v")
+
+def segment_checkers(img, white_thresh, black_thresh):
+    # Preprocessing
+    output = img.copy()
+    white_checkers = template_match(white_thresh, output, threshold=0.5, min_samples=1,
+                                    contour_color=(0, 0, 255), checker_radius=int(img.shape[0] * 0.034))
+    black_checkers = template_match(black_thresh, output, threshold=0.5, min_samples=1,
+                                    contour_color=(0, 255, 0), checker_radius=int(img.shape[0] * 0.034))
+
+    return output, white_checkers, black_checkers
+
+def start_flow(dice_data, hand_data):
+    try:
+        x1, y1 = dice_data["coordinates"][0]
+        x2, y2 = dice_data["coordinates"][1]
+        xmin, ymin, xmax, ymax = hand_data["bbox"]
+        # print(f"({x1},{y1}), ({x2},{y2}), {hand_data["bbox"]}, prev:{dice_data["prev_frame_count"]}, curr:{dice_data["curr_frame_count"]}")
+        if dice_data["prev_frame_count"] > 0 and dice_data["curr_frame_count"] == 0:
+            if xmin <= x1 <= xmax and xmin <= x2 <= xmax and ymin <= y1 <= ymax and ymin <= y2 <= ymax:
+                hand_data["cover_dice"] = True
+                print("Covered dice !!!")
+                return
+        elif dice_data["prev_frame_count"] == 0 and dice_data["curr_frame_count"] == 0 and hand_data["cover_dice"]:
+            if not(xmin <= x1 <= xmax) and not(xmin <= x2 <= xmax) and not(ymin <= y1 <= ymax) and not(ymin <= y2 <= ymax):
+                hand_data["show_flow"] = True
+                player = "white" if ymin+abs((ymax-ymin)/2) < hand_data["half_board"]/2 else "black"
+                _, ymin, _, ymax = hand_data["last_hand_bbox"]
+                if ymin+abs((ymax-ymin)/2) < hand_data["half_board"]/2:
+                    txt = f"🎉 white took the dice, {hand_data["last_hand_bbox"]}, {ymin+abs((ymax-ymin)/2), hand_data["half_board"]/2}"
+                else:
+                    txt = f"🎉 black took the dice, {hand_data["last_hand_bbox"]}, {ymin+abs((ymax-ymin)/2), hand_data["half_board"]/2}"
+                # if hand_data["took_dice_txt"] != txt:
+                print(txt)
+                    # hand_data["took_dice_txt"] = txt
+                hand_data["cover_dice"] = False
+                return
+        # else:
+        #     hand_data["cover_dice"] = False
+    except:
+        return
+    return
+    # if hand_data["show_flow"]:
+
+def show_game(last_verified_state, real_time_state, grid, text_prompt, dice_images):
+    def fit_to_window(window,img):
+        # Define fixed window size
+        window_width, window_height = window
+        # Get image dimensions
+        img = cv2.cvtColor(img.astype(np.uint8), cv2.COLOR_GRAY2RGB) if len(img.shape) == 2 else img
+        h, w = img.shape[:2]
+        # Create a black canvas
+        canvas = np.zeros((window_width, window_height, 3), dtype=np.uint8)
+        # Resize image while maintaining aspect ratio
+        scale = min(window_width / w, window_height / h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        resized_image = cv2.resize(img, (new_w, new_h))
+        # Compute top-left corner for centering
+        x_offset = (window_width - new_w) // 2
+        y_offset = (window_height - new_h) // 2
+        # Place resized image on canvas
+        canvas[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized_image
+
+        return canvas
+
+    last_verified_state = fit_to_window((500, 500), last_verified_state)
+    real_time_state = fit_to_window((500, 500), real_time_state)
+    grid = fit_to_window((500, 500), grid)
+    dice_images = fit_to_window((500, 500), dice_images)
+    text_prompt = fit_to_window((500, 500), text_prompt)
+    canvas = concat_images(last_verified_state, real_time_state)
+    canvas = concat_images(canvas, grid)
+    canvas = concat_images(canvas, dice_images)
+    canvas = concat_images(canvas, text_prompt)
+
+    return canvas
+
+def show_text(text):
+    font = cv2.FONT_HERSHEY_TRIPLEX
+    font_scale = 2
+    thickness = 4
+    text_color = (255, 255, 255)  # White text
+    bg_color = (0, 0, 0)  # Red background
+    canvas = np.zeros((500, 500))
+
+    # Get text size
+    (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+
+    # Calculate text position
+    x = 10
+    y = text_height + 20
+
+    # Put text on top of background
+    cv2.putText(canvas, text, (x, y), font, font_scale, text_color, thickness)
+
+    return canvas
+
+def show_error(img, text):
+    font = cv2.FONT_HERSHEY_TRIPLEX
+    font_scale = 2
+    thickness = 4
+    text_color = (255, 255, 255)  # White text
+    bg_color = (0, 0, 0)  # Red background
+
+    # Get text size
+    (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+
+    # Calculate text position
+    image_height, image_width, _ = img.shape
+    x = (image_width - text_width) // 2
+    y = (image_height + text_height) // 2
+
+    # Draw background rectangle
+    cv2.rectangle(img, (x - 10, y - text_height - 10), (x + text_width + 10, y + baseline + 10), bg_color, -1)
+
+    # Put text on top of background
+    cv2.putText(img, text, (x, y), font, font_scale, text_color, thickness)
+
+def show_dice(dice_images, dice_num):
+    font = cv2.FONT_HERSHEY_TRIPLEX
+    font_scale = 1
+    thickness = 2
+    text_color = (255, 255, 255)  # White text
+    dice_show = []
+    dice_count = min(len(dice_images), len(dice_num))
+    # print(f"Count: {dice_count}")
+    for i in range(dice_count):
+        img = np.zeros_like(dice_images[i])
+        text = str(dice_num[i])
+        # Get text size
+        (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+        # Calculate text position
+        image_height, image_width = img.shape
+        x = (image_width - text_width) // 2
+        y = (image_height + text_height) // 2
+        # Put text on top of background
+        cv2.putText(img, text, (x, y), font, font_scale, text_color, thickness)
+        dice_show.append(concat_images(dice_images[i], img))
+
+        # cv2.imwrite(f"/Users/razbarak/PycharmProjects/PythonProject/DIP_Final_Project/webcam_frames_5/dice_{dice_num[i]}.jpg", dice_images[i])
+
+    if dice_count == 0:
+        return None
+    if dice_count == 1:
+        return dice_show[0]
+    if dice_count == 2:
+        return concat_images(dice_show[0], dice_show[1], "v")
+
+def scale_image(ref_img, resized_img):
+    # Ensure both images are 3 dimensional
+    ref_img = cv2.cvtColor(ref_img, cv2.COLOR_GRAY2RGB) if len(ref_img.shape) == 2 else ref_img
+    resized_img = cv2.cvtColor(resized_img, cv2.COLOR_GRAY2RGB) if len(resized_img.shape) == 2 else resized_img
+    # Ensure both images have the same height
+    h1, w1 = ref_img.shape[:2]
+    # h2, w2 = resized_img.shape[:2]
+    # # Resize edges_img to match frame's height
+    # scale_factor = h1 / h2  # Compute scaling ratio
+    # new_width = int(w2 * scale_factor)  # Adjust width proportionally
+    # resized_img = cv2.resize(resized_img, (new_width, h1))
+    resized_img = cv2.resize(resized_img, (w1, h1), interpolation=cv2.INTER_LINEAR)
+    return resized_img
+
+def concat_images(ref_img, resized_img, ctype="h"):
+    # Ensure both images are 3 dimensional
+    ref_img = cv2.cvtColor(ref_img, cv2.COLOR_GRAY2RGB) if len(ref_img.shape) == 2 else ref_img
+    resized_img = cv2.cvtColor(resized_img, cv2.COLOR_GRAY2RGB) if len(resized_img.shape) == 2 else resized_img
+    # Ensure both images have the same height
+    h1, w1 = ref_img.shape[:2]
+    h2, w2 = resized_img.shape[:2]
+
+    # Concatenate images side by side
+    if ctype == "h":
+        scale_factor = h1 / h2  # Compute scaling ratio
+        new_width = int(w2 * scale_factor)  # Adjust width proportionally
+        resized_img = cv2.resize(resized_img, (new_width, h1))
+        combined = cv2.hconcat([ref_img, resized_img])
+    else:
+        # Resize edges_img to match frame's height
+        scale_factor = w1 / w2  # Compute scaling ratio
+        new_height = int(h2 * scale_factor)  # Adjust width proportionally
+        resized_img = cv2.resize(resized_img, (w1, new_height))
+        combined = cv2.vconcat([ref_img, resized_img])
+    return combined
+
+def track_movement(prev_img, curr_img, prev_corners, patch_size=20):
+    if prev_img is None or curr_img is None:
+        return None
+
+    movement_vectors = []
+    max_vals = []
+    for i in range(len(prev_corners)):
+        patch_prev = extract_patch(prev_img, prev_corners[i], patch_size)
+        res = cv2.matchTemplate(curr_img, patch_prev, cv2.TM_CCOEFF_NORMED)
+        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+        shift = np.array(max_loc) + patch_size // 2 - prev_corners[i]
+        movement_vectors.append(shift)
+        max_vals.append(max_val)
+
+    return np.mean(movement_vectors, axis=0), movement_vectors, max_vals  # Return average movement vector and detailed shifts
+
+def estimate_affine_transform(src_pts, dst_pts):
+    src_pts = np.float32(src_pts[:2])
+    dst_pts = np.float32(dst_pts[:2])
+    return cv2.getAffineTransform(src_pts, dst_pts)
+
+def extract_patch(img, center, size=20):
+    x, y = int(center[0]), int(center[1])
+    half = size // 2
+    return img[max(0, y - half) : min(y + half, img.shape[0]), max(0, x - half) : min(x + half, img.shape[1])]
+
+def compare_patches(prev_img, curr_img, prev_corners, patch_size=20, threshold=0.5):
+    match_corners = 0
+    scores = []
+    if prev_img is None or curr_img is None:
+        return False
+
+    for i in range(4):
+        patch_prev = extract_patch(prev_img, prev_corners[i], patch_size)
+        patch_curr = extract_patch(curr_img, prev_corners[i], patch_size)
+        # print(f"Patch Prev Shape: {patch_prev.shape}, Patch Curr Shape: {patch_curr.shape}")
+
+        score = ssim(patch_prev, patch_curr, channel_axis=-1)
+        scores.append(score)
+        if score > threshold:
+            match_corners += 1
+
+    if match_corners > 1:
+        return True
+    # print(scores)
+    return False
+
+def safe_polyfit(x_values, y_values):
+    if np.isnan(x_values).any() or np.isnan(y_values).any():
+        # print("Warning: NaN values detected in polyfit inputs!")
+        return None
+
+    if abs(x_values[0] - x_values[1]) < 1e-6:  # Detect near-vertical lines
+        # print(f"Warning: Near-vertical line detected at x = {x_values[0]}")
+        return None  # Undefined slope
+
+    return np.polyfit(x_values, y_values, 1)[0]  # Return slope m
+
+def detect_board(last_frame, frame, game):
+    # Step 1: Preprocessing
+    # resize_factor = 0.5  # Reduce image size to 50% (tune this value)
+    # frame = cv2.resize(frame, None, fx=resize_factor, fy=resize_factor, interpolation=cv2.INTER_LINEAR)
+    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+    blurred = cv2.medianBlur(gray, 3)  # Kernel size of 3
+
+    # Step 2: Edge Detection
+    edges = cv2.Canny(blurred, 50, 150)
+
+    # Step 3: Morphological Closing to connect lines
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    dilated = cv2.dilate(edges, kernel, iterations=2)  # Expand edges slightly changed from 2 to 1
+    closed = cv2.morphologyEx(dilated, cv2.MORPH_CLOSE, kernel, iterations=3)
+
+    # Step 4: Find Contours
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    board_corners = None
+    sorted_contours = sorted(contours, key=cv2.contourArea, reverse=True)
+    for contour in sorted_contours:
+        epsilon = 0.02 * cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+        if len(approx) == 4 and cv2.contourArea(approx) > 0.1 * frame.size:
+            # game["contour_break"] = False
+            board_corners = approx.reshape(4, 2)
+            break
+
+    # cv2.drawContours(frame, [board_corners], -1, (0, 255, 0), 3)  # Green line
+    # print(board_corners)
+    # if game["board_corners"] is not None:
+    #     last_board_corners = compare_patches(last_frame, frame, game["board_corners"])
+    #     if last_board_corners.shape[0] == 4:
+    #         board_corners = last_board_corners
+
+    # Debugging: Draw the detected polygon
+    if board_corners is None:
+        # game["contour_break"] = True
+        # print("Checking if corners moved")
+        if game["board_corners"] is not None:
+            # print(f"Saved corners: {game["board_corners"].flatten()}")
+            # print("Found past corners")
+            # board_corners = compare_patches(last_frame, frame, game["board_corners"])
+            # board_corners = np.array(board_corners, dtype=np.int32)
+            # print(board_corners.shape)
+            if compare_patches(last_frame, frame, game["board_corners"]):
+                board_corners = game["board_corners"].astype(np.int32)
+                # game["contour_break"] = True
+            else:
+                # shift, movement_vectors, max_vals = track_movement(last_frame, frame, game["board_corners"])
+                # if shift is not None:  # only work for small shifts
+                #     #                board_corners = last_corners + shift
+                #     top_indices = np.argsort(max_vals)[-2:]
+                #     src_pts = [game["board_corners"][i] for i in top_indices]
+                #     dst_pts = [game["board_corners"][i] + movement_vectors[i] for i in top_indices]
+                #     affine_matrix = estimate_affine_transform(src_pts, dst_pts)
+                #     board_corners = cv2.transform(np.array([game["board_corners"]]), affine_matrix)[0]
+                # print("Returning")
+                # game["contour_break"] = False
+                return None, closed
+        else:
+            return None, closed
+
+    # print(board_corners)
+    # cv2.drawContours(frame, [board_corners], -1, (0, 0, 255), 3)  # Green line
+    # board_corners = refine_board_corners(frame, board_corners)
+
+    # gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+    # gray32 = np.float32(gray)
+    # dst = cv2.cornerHarris(gray32, 10, 3, 0.04)
+    # dst = cv2.dilate(dst, None)
+    # threshold = 0.001 * dst.max()
+    # frame[dst > threshold] = [255, 255, 0]
+
+    def order_points(pts):
+        rect = np.zeros((4, 2), dtype="float32")
+        s = pts.sum(axis=1)
+        rect[0] = pts[np.argmin(s)]
+        rect[2] = pts[np.argmax(s)]
+
+        diff = np.diff(pts, axis=1)
+        rect[1] = pts[np.argmin(diff)]
+        rect[3] = pts[np.argmax(diff)]
+
+        return rect
+
+    # Order the corners
+    ordered_corners = order_points(board_corners)
+
+    # if game["legal_state_buffer"] > 2:
+    #     game["last_corners"] = ordered_corners
+    #     game["legal_state_buffer"] = 0
+    # else:
+    # if game["last_corners"] is None:
+    #     game["last_corners"] = ordered_corners
+    # else:
+    #     distances = np.linalg.norm(ordered_corners - game["last_corners"], axis=1)
+    #     moved_corners = np.sum(distances > 5)
+    #     if moved_corners >= 3:
+    #         # print(True)
+    #         if game["board_buffer"] < 2:
+    #             game["board_buffer"] += 1
+    #             ordered_corners = game["last_corners"]
+    #         else:
+    #             game["board_buffer"] = 0
+    #             game["last_corners"] = ordered_corners
+    #     else:
+    #         ordered_corners = game["last_corners"]
+
+    # Compute the width and height of the new image
+    (tl, tr, br, bl) = ordered_corners
+    width_top = np.linalg.norm(tr - tl)
+    width_bottom = np.linalg.norm(br - bl)
+    height_left = np.linalg.norm(tl - bl)
+    height_right = np.linalg.norm(tr - br)
+
+    try:
+        w1 = safe_polyfit((tl[0], tr[0]), (tl[1], tr[1]))  # Top edge
+        w2 = safe_polyfit((bl[0], br[0]), (bl[1], br[1]))  # Bottom edge
+        h1 = safe_polyfit((bl[0], tl[0]), (bl[1], tl[1]))  # Left edge
+        h2 = safe_polyfit((br[0], tr[0]), (br[1], tr[1]))  # Right edge
+
+        # Convert slopes to angles
+        def slope_to_angle(m):
+            return np.degrees(np.arctan(m)) if m is not None else None
+
+        angle_w1 = slope_to_angle(w1)
+        angle_w2 = slope_to_angle(w2)
+        angle_h1 = slope_to_angle(h1)
+        angle_h2 = slope_to_angle(h2)
+
+        # print(f"Width ratio: {width_top / width_bottom}, Height ratio: {height_left / height_right}")
+        # print(f"Width Angles ratio: {abs(angle_w1 - angle_w2):.2f}, Height Angles ratio: {abs(angle_h1 - angle_h2):.2f}")
+
+        if abs(angle_w1 - angle_w2) > 1.5 or abs(angle_h1 - angle_h2) > 1.5:
+            # print(f"Stopped at {abs(angle_w1 - angle_w2):.2f}, {abs(angle_h1 - angle_h2):.2f}")
+            return None, closed
+    except:
+        a = 1
+
+    # print(max(width_top, width_bottom), max(height_left, height_right), frame.shape)
+    if max(width_top, width_bottom) < frame.shape[1] * 0.3 or max(height_left, height_right) < frame.shape[0] * 0.3:
+      # cv2.drawContours(frame, [board_corners], -1, (0, 0, 255), 3)  # Green line
+      # print("Too small")
+      return None, closed
+
+    # Use the maximum width and height for the new image
+    # if max_width == 0 and max_height == 0:
+    max_width = int(max(width_top, width_bottom))
+    max_height = int(max(height_left, height_right))
+
+    # Destination points for the perspective transform
+    dst = np.array([
+        [0, 0],
+        [max_width - 1, 0],
+        [max_width - 1, max_height - 1],
+        [0, max_height - 1]
+    ], dtype="float32")
+
+    # Compute the perspective transform matrix
+    matrix = cv2.getPerspectiveTransform(ordered_corners, dst)
+
+    # Apply the perspective warp
+    warped = cv2.warpPerspective(frame, matrix, (max_width, max_height))
+    # warped = cv2.cvtColor(warped, cv2.COLOR_BGR2RGB)
+    # print(board_corners)
+    cv2.drawContours(frame, [board_corners], -1, (0, 255, 0), 3)  # Green line
+    # print("Got here!")
+    game["board_corners"] = ordered_corners
+    return warped, closed
+
+def detect_hand(image_empty, image_hand, data, hand_data):
+    # Resize both images to match dimensions
+    height, width = image_empty.shape[:2]
+    image_hand = cv2.resize(image_hand, (width, height))
+    image_hand = cv2.cvtColor(image_hand, cv2.COLOR_BGR2RGB)
+    resize_factor = 0.5  # Reduce image size to 50% (tune this value)
+    image_empty = cv2.resize(image_empty, None, fx=resize_factor, fy=resize_factor, interpolation=cv2.INTER_LINEAR)
+    image_hand = cv2.resize(image_hand, None, fx=resize_factor, fy=resize_factor, interpolation=cv2.INTER_LINEAR)
+
+    # Convert images to grayscale
+    gray_empty = cv2.cvtColor(image_empty, cv2.COLOR_BGR2GRAY)
+    gray_hand = cv2.cvtColor(image_hand, cv2.COLOR_BGR2GRAY)
+
+    # Compute Dense Optical Flow using Farneback
+    flow = cv2.calcOpticalFlowFarneback(gray_empty, gray_hand, None, 0.5, 3, 21, 3, 7, 1.6, 0)
+
+    # Calculate magnitude and angle of flow
+    mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+
+    # Normalize magnitude to [0, 255]
+    motion_mask = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    # Apply threshold to highlight movement
+    _, motion_thresh = cv2.threshold(motion_mask, 10, 255, cv2.THRESH_BINARY)
+
+    # Find contours of motion areas
+    contours, _ = cv2.findContours(motion_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Convert angle to degrees (0-360 mapped to 0-180 for HSV)
+    hsv = np.zeros_like(cv2.cvtColor(gray_empty, cv2.COLOR_GRAY2BGR))
+    hsv[..., 1] = 255  # Full saturation (pure colors)
+
+    # Map angle to hue (0-180)
+    hsv[..., 0] = ang * (180 / np.pi / 2)  # Normalize to HSV range
+
+    # Normalize magnitude to value channel (brightness)
+    hsv[..., 2] = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX)
+
+    # Convert HSV to BGR for display
+    flow_color = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+
+    hand_data["motion_mask"] = flow_color
+    hand_data["processed_image"] = image_hand.copy()
+
+    # If motion is detected, find bounding shape
+    if contours:
+        largest_contour = max(contours, key=cv2.contourArea)
+
+        # Get minimal bounding rectangle
+        rect = cv2.minAreaRect(largest_contour)  # (center, (width, height), angle)
+        box = cv2.boxPoints(rect)  # Get corner points
+        box = np.intp(box)  # Convert to integer
+        hand_data["min_area_rectangle"] = box
+
+        x, y, w, h = cv2.boundingRect(largest_contour)
+
+        # Store bounding box coordinates
+        hand_data["bounding_box"] = (x, y, w, h)
+        # Draw bounding box on the image
+
+        # Draw rectangle around detected hand
+        if w*h < 50000:
+            # data["detect_counter"] += 1
+            # if data["detect_counter"] > 3:
+            hand_data["last_hand_bbox"] = hand_data["bbox"]
+            hand_data["bbox"] = (x*2, y*2, (x+w)*2, (y+h)*2)
+            # print(f"BBOX: {hand_data["bbox"]}")
+            # cv2.rectangle(hand_data["processed_image"], (x, y), (x + w, y + h), (255, 255, 0), 3)
+            # print(x + w//2, y+ h//2)
+            center = (x + w//2, y+ h//2)
+            distance = np.sqrt((center[0] - hand_data["last_center"][0])**2 + (center[1] - hand_data["last_center"][1])**2)
+            # print(distance)
+            hand_data["last_center"] = center
+            hand_data["dist_lst"].append(distance)
+            if len(hand_data["dist_lst"]) == 5:
+                # print(np.mean(hand_data["dist_lst"]))
+                hand_data["dist_lst"].pop(0)
+            # print(hand_data["show_flow"])
+            if hand_data["cover_dice"]:
+                print("Start draw")
+                cv2.drawContours(hand_data["processed_image"], [box], 0, (255, 0, 0), 2)
+                # plt.figure(figsize=(5, 5)), plt.title(f"Detected Hand"), plt.imshow(hand_data["processed_image"]), plt.axis('off'), plt.tight_layout()
+                # plt.savefig(f"final_images/take_1/hand/bbox.png", dpi=300, bbox_inches="tight"), plt.show()
+                # plt.figure(figsize=(5, 5)), plt.title(f"Motion Mask"), plt.imshow(hand_data["motion_mask"]), plt.axis('off'), plt.tight_layout()
+                # plt.savefig(f"final_images/take_1/hand/motion_mask.png", dpi=300, bbox_inches="tight"), plt.show()
+                # print(bbox)
+            # print(np.max(mag), w * h, np.sum(motion_mask > motion_thresh))
+        else:
+            hand_data["bbox"] = (0, 0, 0, 0)
+            data["detect_counter"] = 0
+            print("Changed to False")
+            hand_data["show_flow"] = False
+
+    return
+
+def init_game():
+    game = {
+        "prev_game_state": np.array([0,  2,  0,  0,  0,  0, -5,  0, -3,  0,  0,  0,  5, -5,  0,  0,  0,  3,  0,  5,  0,  0,  0,  0, -2,  0]), #[np.zeros(26, dtype=np.int8),
+        "curr_game_state" : np.zeros(26, dtype=np.int8),
+        "prev_dice" : [],
+        "curr_dice" : [],
+        "checkers_count" : [15, 15],
+        "mode" : "create grid", # "create grid" / "get start player" / "play game" / "bear off game"
+        "turn" : "", # Change
+        "restart" : False,
+        "white_throw" : None,
+        "black_throw" : None,
+        "restart_throw" : False,
+        "frame_buffer" : 0,
+        "last_corners" : None,
+        "board_buffer" : 0,
+        "last_error" : "",
+        "legal_state_buffer" : 0,
+        "dice_buffer" : 0,
+        "options_txt" : "",
+        "change_state_txt" : "",
+        "missing_dice_txt" : "",
+        "turn_dice" : [],
+        "can_bear_txt" : ["",""],
+        "text" : "",
+        "board_corners" : None,
+        "contour_break" : False,
+        "num_broken" : 0
+    }
+    data = {
+        "board_corners": None,
+        "board_buffer": 0,
+        "detect_counter": 0,
+        "player_hand": ""
+    }
+    dice_data = {
+        "coordinates": [(), ()],
+        "prev_frame_count": None,
+        "curr_frame_count": None,
+
+    }
+    hand_data = {
+        "cover_dice": False,
+        "show_flow": False,
+        "bbox": (0, 0, 0, 0),
+        "half_board": 0,
+        "took_dice_txt": "",
+        "last_hand_bbox": (0, 0, 0, 0),
+        "last_center" : (0, 0),
+        "dist_lst": []
+
+    }
+    return game, data, dice_data, hand_data
+
+"""Main -------------------------------------------------------------------------------------------------------------"""
+def main():
+    # Initiate Game
+    game, data, dice_data, hand_data = init_game()
+    last_frame = None
+    blank_board = None
+
+    # Start Processing
+    cap = cv2.VideoCapture(0)  # Open webcam
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if last_frame is None:
+            last_frame = frame
+            continue
+
+        # Detect game board
+        aligned_board, edges_img = detect_board(last_frame, frame, game)
+
+        if aligned_board is not None: # Successfully detected board
+            if blank_board is None:
+                blank_board = aligned_board
+                continue
+
+            # if game["contour_break"]:
+            detect_hand(blank_board, aligned_board, data, hand_data)
+            hand_data["half_board"] = aligned_board.shape[0]
+            blank_board = aligned_board
+
+            white_mask = white_threshold(aligned_board)
+            black_mask = black_threshold(aligned_board)
+            aligned_board, white_checkers, black_checkers = segment_checkers(aligned_board, white_mask, black_mask)
+            dice_images, dice = detect_dice(aligned_board, white_mask, black_mask, white_checkers, dice_data)
+            start_flow(dice_data, hand_data)
+
+            cv2.imshow("Aligned Backgammon Board", concat_images(hand_data["processed_image"], hand_data["motion_mask"]))
+
+            # cv2.imshow("Aligned Backgammon Board", aligned_board)
+        cv2.imshow("Backgammon Board Detection", concat_images(frame, edges_img))
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):  # Press 'q' to quit
+            break
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
