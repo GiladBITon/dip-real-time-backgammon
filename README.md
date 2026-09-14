@@ -1,4 +1,4 @@
-# Real-Time Backgammon Detection and Tracking 🎲
+# Real-Time Backgammon Detection and Tracking 
 
 ## Overview
 This project focuses on the real-time detection and tracking of a physical backgammon game using computer vision techniques. The system automatically monitors the gameplay, identifies the state of the board, and determines legal moves—without requiring any hardware interaction from the players. 
