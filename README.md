@@ -26,8 +26,8 @@ This project is heavily based on classical image processing pipelines:
 ## Repository Structure
 ```text
 ├── src/                    # Source code (algorithms and logic)
-├── data/                   # Sample images or short test videos
+├── data/                   # Sample images 
 ├── docs/                   # Final project reports and documentation
-├── assets/                 # Images used in this README
+├── assets/                 # Images used in the Final Project report
 ├── requirements.txt        # Python dependencies
 └── README.md               # Project documentation
